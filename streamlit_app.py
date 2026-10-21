@@ -252,7 +252,7 @@ st.caption("Not a certified medical diagnostic device. Results come from a "
 file = st.file_uploader("Upload a microscope image of a dried amniotic fluid "
                          "sample (JPG or PNG)", type=["jpg", "jpeg", "png"])
 
-st.write("Only images captured by the Amnioscan Image Capturing Module will be analyzed. Error will happen if wrong image has been uploaded")
+st.write("Only AmnioSCAN-captured images are accepted; other images will cause an error.")
 
 with st.expander("Advanced settings"):
     stride = st.select_slider("Stride (higher = faster, coarser)", options=[128, 160, 192, 256], value=128)
@@ -285,7 +285,7 @@ with st.spinner("Checking the image..."):
 if not check["passed"]:
     st.error("This doesn't look like a microscope image of an amniotic fluid sample, "
              "so no analysis was run. Please upload a photo of the dried sample on a "
-             "slide, taken through the microscope.")
+             "slide, taken through the Amnioscan microscope.")
     if check["score"] is None:
         st.caption(f"Reason: too little usable image area (found {check['n_valid']} regions).")
     else:
