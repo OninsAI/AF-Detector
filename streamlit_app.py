@@ -5,6 +5,7 @@
 #     streamlit_app.py       <- this file
 #     requirements.txt       <- written by export_for_deploy.py
 #     ferning_b2_head.pt     <- written by export_for_deploy.py
+#     sample_gate.npz        <- written by build_sample_gate.py
 #
 # Design notes
 #   * Memory-conscious (free tier is ~1 GB): patches are scored in small
@@ -33,6 +34,7 @@ TUNED_STRIDE = 128          # stride at which the minimum patch counts were tune
 BATCH = 16
 DISPLAY_MAX = 1400          # longest side of the images shown on screen
 HEAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ferning_b2_head.pt")
+GATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_gate.npz")
 
 DEFAULT_STRICT, DEFAULT_LOOSE = 0.99, 0.90
 DEFAULT_MIN_STRICT, DEFAULT_MIN_LOOSE = 10, 20
@@ -124,6 +126,72 @@ def score_image(data: bytes, stride: int):
 
 
 # =============================================================================
+# 3b. SAMPLE CHECK -- only analyse images that look like the training slides
+# =============================================================================
+# gate_sample() / the scoring below must stay identical to build_sample_gate.py,
+# which calibrated the threshold using exactly this procedure.
+
+@st.cache_resource(show_spinner=False)
+def load_gate():
+    if not os.path.exists(GATE_PATH):
+        return None
+    g = np.load(GATE_PATH)
+    return {
+        "ref": g["ref"].astype(np.float32),
+        "mean": g["mean"].astype(np.float32),
+        "threshold": float(g["threshold"]),
+        "k": int(g["k"]),
+        "n_patches": int(g["n_patches"]),
+        "min_valid": int(g["min_valid"]),
+    }
+
+
+@torch.inference_mode()
+def embed(patches_rgb):
+    model, transform, _ = load_model()
+    batch = torch.stack([transform(Image.fromarray(p)) for p in patches_rgb])
+    feats = model.forward_head(model.forward_features(batch), pre_logits=True)
+    return feats.float().numpy()
+
+
+def gate_sample(bgr, n_patches):
+    h, w = bgr.shape[:2]
+    coords = []
+    for y in range(0, max(1, h - PATCH_SIZE + 1), PATCH_SIZE):
+        for x in range(0, max(1, w - PATCH_SIZE + 1), PATCH_SIZE):
+            patch = bgr[y:y + PATCH_SIZE, x:x + PATCH_SIZE]
+            if patch.shape[0] != PATCH_SIZE or patch.shape[1] != PATCH_SIZE:
+                continue
+            if is_valid_patch(patch):
+                coords.append((x, y))
+    n_valid = len(coords)
+    if n_valid == 0:
+        return [], 0
+    idx = np.unique(np.linspace(0, n_valid - 1, min(n_patches, n_valid)).round().astype(int))
+    return [clean_patch(bgr[coords[i][1]:coords[i][1] + PATCH_SIZE,
+                            coords[i][0]:coords[i][0] + PATCH_SIZE]) for i in idx], n_valid
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def check_sample(data: bytes):
+    """Does this image look like the slide photos the model was built for?"""
+    gate = load_gate()
+    bgr = decode_image(data)
+    patches, n_valid = gate_sample(bgr, gate["n_patches"])
+    result = {"passed": False, "score": None, "n_valid": n_valid,
+              "threshold": gate["threshold"]}
+    if n_valid < gate["min_valid"]:
+        return result
+    f = embed(patches) - gate["mean"]
+    f /= np.linalg.norm(f, axis=1, keepdims=True) + 1e-8
+    sims = f @ gate["ref"].T
+    k = min(gate["k"], sims.shape[1])
+    score = float(np.median(np.sort(sims, axis=1)[:, -k:].mean(axis=1)))
+    result.update(score=score, passed=score >= gate["threshold"])
+    return result
+
+
+# =============================================================================
 # 4. VOTING + OVERLAYS (cheap; re-runs whenever a slider moves)
 # =============================================================================
 
@@ -181,12 +249,15 @@ st.title("Ferning Pattern Detector")
 st.caption("Not a certified medical diagnostic device. Results come from a "
            "research model and shouldn't replace clinical judgment or a confirmed test.")
 
-tab_upload, tab_camera = st.tabs(["Upload / phone camera", "Quick camera"])
-with tab_upload:
-    uploaded = st.file_uploader("Choose a photo (on a phone this can open the camera, "
-                                "at full resolution)", type=["jpg", "jpeg", "png"])
-with tab_camera:
-    captured = st.camera_input("Take a photo")
+file = st.file_uploader("Upload a microscope image of a dried amniotic fluid "
+                         "sample (JPG or PNG)", type=["jpg", "jpeg", "png"])
+
+with st.expander("About the sample check"):
+    st.write("Before analysing anything, the app checks that the image looks like the "
+             "microscope slide photos the model was built for. Images that don't "
+             "(random photos, screenshots, other subjects) are rejected and not analysed. "
+             "The check recognises how the image *looks*; it can't confirm what fluid "
+             "is actually on the slide.")
 
 with st.expander("Advanced settings"):
     stride = st.select_slider("Stride (higher = faster, coarser)", options=[128, 160, 192, 256], value=128)
@@ -197,9 +268,8 @@ with st.expander("Advanced settings"):
     st.caption("The minimum counts were tuned at stride 128 and are scaled "
                "automatically if you change the stride.")
 
-file = uploaded or captured
 if file is None:
-    st.info("Upload or take a photo to begin.")
+    st.info("Upload an image to begin.")
     st.stop()
 
 if t_loose > t_strict:
@@ -207,6 +277,30 @@ if t_loose > t_strict:
     st.stop()
 
 data = file.getvalue()
+
+# --- sample check: the ferning model only runs on images that pass ---
+if load_gate() is None:
+    st.error("The sample-check file (sample_gate.npz) is missing from this app, "
+             "so analysis is disabled.")
+    st.stop()
+
+with st.spinner("Checking the image..."):
+    check = check_sample(data)
+
+if not check["passed"]:
+    st.error("This doesn't look like a microscope image of an amniotic fluid sample, "
+             "so no analysis was run. Please upload a photo of the dried sample on a "
+             "slide, taken through the microscope.")
+    if check["score"] is None:
+        st.caption(f"Reason: too little usable image area (found {check['n_valid']} regions).")
+    else:
+        st.caption(f"Match score {check['score']:.2f}; at least {check['threshold']:.2f} is required.")
+    st.image(data, caption="Uploaded image", width=300)
+    st.stop()
+
+st.caption(f"Sample check passed (match score {check['score']:.2f}, "
+           f"required {check['threshold']:.2f}).")
+
 with st.spinner("Scanning the photo... this can take a minute on the free tier."):
     coords, probas = score_image(data, stride)
 
