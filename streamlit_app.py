@@ -252,12 +252,7 @@ st.caption("Not a certified medical diagnostic device. Results come from a "
 file = st.file_uploader("Upload a microscope image of a dried amniotic fluid "
                          "sample (JPG or PNG)", type=["jpg", "jpeg", "png"])
 
-with st.expander("About the sample check"):
-    st.write("Before analysing anything, the app checks that the image looks like the "
-             "microscope slide photos the model was built for. Images that don't "
-             "(random photos, screenshots, other subjects) are rejected and not analysed. "
-             "The check recognises how the image *looks*; it can't confirm what fluid "
-             "is actually on the slide.")
+st.write("Only images captured by the Amnioscan Image Capturing Module will be analyzed. Error will happen if wrong image has been uploaded")
 
 with st.expander("Advanced settings"):
     stride = st.select_slider("Stride (higher = faster, coarser)", options=[128, 160, 192, 256], value=128)
